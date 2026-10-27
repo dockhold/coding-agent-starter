@@ -1,0 +1,62 @@
+name: Upstream release check
+# Once a week, compare the Claude Code version pinned in the Dockerfile with
+# the latest version on npm. When they differ, open one issue (or update the
+# open one) with the new version and the upgrade steps. The pin keeps
+# rebuilds identical; this is what keeps it from going stale unnoticed.
+on:
+  schedule:
+    - cron: '23 6 * * 1'
+  workflow_dispatch:
+permissions:
+  contents: read
+  issues: write
+jobs:
+  compare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Compare the pinned version with the latest release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -eu
+          pinned=$(sed -n 's/^ARG CLAUDE_CODE_VERSION=\([0-9][0-9.]*\)$/\1/p' Dockerfile | head -n 1)
+          [ -n "$pinned" ] || { echo "could not read CLAUDE_CODE_VERSION from the Dockerfile"; exit 1; }
+          latest=$(npm view @anthropic-ai/claude-code version)
+          # The version comes from outside this repo. Accept digits and dots
+          # only before it goes anywhere near a shell or an issue.
+          case "$latest" in
+            *[!0-9.]*|"") echo "unexpected version: $latest"; exit 1 ;;
+          esac
+          echo "pinned: $pinned, latest: $latest"
+          if [ "$pinned" = "$latest" ]; then
+            echo "up to date"
+            exit 0
+          fi
+          title="Upstream release: Claude Code ${latest} (pinned ${pinned})"
+          body=$(cat <<BODY
+          Claude Code **${latest}** is the latest version on npm; this starter pins **${pinned}**.
+
+          Changelog: https://github.com/anthropics/claude-code/blob/main/CHANGELOG.md
+
+          To upgrade:
+
+          1. Read the changelog from ${pinned} to ${latest}. Look for changes to print mode (\`-p\`), \`--bare\`, permissions, MCP configuration and the stream-json output.
+          2. In the Dockerfile set \`CLAUDE_CODE_VERSION=${latest}\`.
+          3. Push a branch. The Check workflow builds the image, runs the unit and loop tests, and the smoke test, which fails if the new version rejects any option this starter passes.
+          4. Run one real task on a test repository before merging.
+          5. Add a CHANGELOG entry, then merge.
+
+          This issue is updated by the weekly upstream check until the pin moves.
+          BODY
+          )
+          gh label create upstream --description "Upstream release moved" --color 0E8A16 --force >/dev/null 2>&1 || true
+          existing=$(gh issue list --state open --label upstream --search "Upstream release: Claude Code in:title" \
+            --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue edit "$existing" --title "$title" --body "$body"
+            echo "updated issue #$existing"
+          else
+            gh issue create --title "$title" --body "$body" --label upstream
+          fi

@@ -1,0 +1,30 @@
+name: Check
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - name: Build the image
+        run: docker build -t coding-agent-starter:test .
+      - name: Image size
+        # The README names the App size and storage to pick. Print the image
+        # size those choices rest on. docker image inspect reports the
+        # uncompressed size; the gzip of a docker save is a close estimate of
+        # the compressed size a registry sees.
+        run: |
+          uncompressed=$(docker image inspect coding-agent-starter:test --format '{{.Size}}')
+          compressed=$(docker save coding-agent-starter:test | gzip -9 | wc -c)
+          echo "uncompressed: $((uncompressed / 1048576)) MiB ($uncompressed bytes)"
+          echo "compressed (docker save | gzip -9): $((compressed / 1048576)) MiB ($compressed bytes)"
+      - name: Unit and loop tests
+        # Run inside the image, as user 1001, so the tests use the same node
+        # and git the app runs with.
+        run: |
+          docker run --rm --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges \
+            -v "$PWD:/src:ro" -e HOME=/tmp --entrypoint node coding-agent-starter:test \
+            --test '/src/tests/*.test.mjs'
+      - name: Smoke test
+        run: tests/smoke.sh coding-agent-starter:test
