@@ -23,7 +23,8 @@ The template is Dockhold's, not Anthropic's.
      Under **Repository access** pick **Only select repositories** and choose
      the one repository the agent works on. Under **Permissions** set
      **Contents**, **Issues** and **Pull requests** to **Read and write**.
-     **Metadata** is read-only and added on its own.
+     **Metadata** is read-only and added on its own; the app uses it to
+     check that an issue's author has write access.
 2. Open the [Deploy link](https://app.dockhold.eu/new?repo=https://github.com/dockhold/coding-agent-starter&name=coding-agent-starter&ref=button-coding-agent)
    and sign in if asked.
 3. Under **App size**, pick **1 GB**. Under **App storage**, turn it on and
@@ -60,16 +61,20 @@ dashboard sidebar. Fix it and click **Restart**.
 
 1. Every `AGENT_POLL_MINUTES` the app lists the open issues in `AGENT_REPO`
    that carry `AGENT_LABEL`, oldest first. It skips pull requests, issues
-   opened by anyone other than the repository's owner, members and
-   collaborators, and issues it already finished.
+   it already finished, and issues whose author has no write access to the
+   repository (write, maintain or admin; the owner always has it).
 2. It claims the oldest one by removing the label.
 3. It fetches the repository's default branch into App storage, resets the
-   checkout to it, and creates the branch `agent/issue-<number>`.
+   checkout to it, and creates the branch `agent/issue-<number>`. The
+   agent's home folder is emptied, so every task starts clean.
 4. It runs Claude Code in print mode on the checkout. The prompt is the
    issue's title and body; comments are not read. A `CLAUDE.md` at the
-   repository root is passed to the agent as extra instructions. The
-   repository's own `.claude/` settings, hooks and `.mcp.json` are not
-   loaded, because in print mode they would run without asking anyone.
+   repository root is added to the prompt after the issue, marked as the
+   repository's own instructions. Nothing in the repository's `.claude/`
+   folder (settings, hooks, skills, commands, agents) and no `.mcp.json`
+   is loaded, and neither is anything in the agent's home folder, because
+   in print mode it would run without asking anyone. The only MCP server
+   the agent can have is Dockhold's, when you set the token.
 5. The agent may use the tools in `AGENT_ALLOWED_TOOLS` without asking.
    Anything else that would need a yes is refused, since nobody is there to
    answer, and the agent carries on without it.
@@ -85,7 +90,11 @@ dashboard sidebar. Fix it and click **Restart**.
 One task runs at a time. When one finishes, the app polls again at once.
 If the app is stopped in the middle of a task (a restart or a redeploy), it
 stops the agent, puts the label back on the issue, and the task runs again
-after the start. An issue that already got a pull request or a "no changes"
+after the start. If the app stopped without warning (a crash, or running
+out of memory), the label goes back at the next start. After 3 runs of the
+same issue cut short that way, the app leaves the label off and comments on
+the issue instead; add the label again to retry. Until a label is back,
+the app claims no other issue. An issue that already got a pull request or a "no changes"
 comment is not picked up again, even with the label back; open a new issue
 for more work.
 
@@ -118,8 +127,9 @@ Variables are set on the app's **Variables** tab; change one and click
 ## Security
 
 **An agent does what an issue says.** On a public repository anyone can open
-an issue, so only issues opened by the repository's owner, members and
-collaborators run. Anyone else's issue is skipped with one line in the log.
+an issue, so an issue runs only when its author has write access to the
+repository (write, maintain or admin). Anyone else's issue is skipped with
+one line in the log.
 Issue comments are never read. The agent also reads your repository's files,
 and text in them can steer it, so review every pull request it opens the way
 you would review a stranger's.
@@ -137,8 +147,9 @@ pushes `agent/issue-<number>` branches. It cannot merge; you do.
 set one. It needs the key to work, and anything it runs (your tests, your
 build, a package install) runs with the same access, with internet access.
 Use a key for this app alone and revoke it if in doubt. The app refuses to
-push a change that contains one of its secret values, but treat that as a
-guard against accidents, not against a determined agent. With `Bash` in
+push a change that contains one of its secret values. That check matches
+only the exact value or its base64 form, so treat it as a guard against
+accidents, not against a determined agent. With `Bash` in
 `AGENT_ALLOWED_TOOLS` the agent runs any command; take `Bash` out, or allow
 only the commands you want, such as `Bash(npm test *)`, to narrow it.
 
@@ -146,12 +157,26 @@ only the commands you want, such as `Bash(npm test *)`, to narrow it.
 tools. With it, the agent gets the Dockhold MCP server and can use it with
 the token's permissions, on every app in your account, not only this one.
 Create it under **API tokens** in the dashboard sidebar as **Read & deploy**,
-and leave **Also allow writing secrets** off. Such a token lets the agent
-list your apps, read their status and logs, deploy a repository as a new app,
-redeploy and restart apps, set variables, resize apps and databases, and add
-or remove an app's storage (removing erases its files). It cannot read or
-write secrets. If the agent only needs to look, a **Read-only** token is
-enough.
+and leave **Also allow writing secrets** off. Such a token lets the agent:
+
+* list your apps and read their status, logs and resource use;
+* list the names of your secrets and which apps they are attached to (never
+  their values);
+* deploy any repository your account's GitHub connection can see as a new
+  app, private repositories included;
+* redeploy and restart apps, and set or remove variables on any of them,
+  which changes how other apps are configured;
+* resize apps and databases, and add or remove an app's storage (removing
+  erases its files).
+
+It cannot write secrets or read their values. If the agent only needs to
+look, a **Read-only** token is enough.
+
+**What runs is what this repository holds.** An app deployed from this
+template is built from this repository, and **Build again** on the app page
+rebuilds it from the latest commit here. Since the app holds your keys, to
+control exactly what code runs, make your own copy with **Use this
+template** and deploy from that.
 
 **The status page is public.** It shows the repository name, issue titles,
 pull request links and errors, never a key or token. If those titles are
@@ -205,15 +230,22 @@ did.
 
 ## Upgrading
 
-The `Dockerfile` pins one Claude Code version (`CLAUDE_CODE_VERSION`). Your
-app stays on the version it was built with; **Restart** does not pull new
-code. To move to a newer version, click **Use this template** on GitHub to
-make your own copy, connect that repository in Dockhold, change
-`CLAUDE_CODE_VERSION` and push. The repository's checks
-(`.github/workflows/check.yml`) build the image and run the tests, including
-one that fails if the new version no longer accepts an option this template
-passes. A weekly check (`.github/workflows/upstream.yml`) opens an issue
-when a newer Claude Code is out. See [CHANGELOG.md](CHANGELOG.md).
+The `Dockerfile` pins one Claude Code version (`CLAUDE_CODE_VERSION`), and
+this repository moves that pin when a newer version has passed its tests.
+A weekly check (`.github/workflows/upstream.yml`) opens an issue here when
+a newer Claude Code is out. See [CHANGELOG.md](CHANGELOG.md).
+
+* **Build again** on the app page rebuilds the app from the latest commit
+  of this repository, the Claude Code pin included. That is the plain way
+  to move to this template's latest.
+* **Restart** only restarts the version that is running.
+* To control exactly what runs (the app holds your keys), click **Use this
+  template** on GitHub to make your own copy, connect that repository in
+  Dockhold and deploy from it. You then move the pin yourself: change
+  `CLAUDE_CODE_VERSION` and push. The checks
+  (`.github/workflows/check.yml`) build the image and run the tests,
+  including one that fails if the new version no longer accepts an option
+  this template passes.
 
 ## License
 

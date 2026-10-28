@@ -166,7 +166,7 @@ expect_one_line_refusal "AGENT_POLL_MINUTES 0: one line, exit 1" \
 # ---------------------------------------------------------------------------
 echo "==== The pinned Claude Code accepts the command line the app builds"
 # The exact argument list from agent/lib.mjs, with every optional part on
-# (Dockhold token, the repository's CLAUDE.md). An unknown or renamed option
+# (the Dockhold token). An unknown or renamed option
 # makes Claude Code exit at once with "unknown option"; a valid list makes it
 # start and wait for the model provider, which this network never reaches.
 # So "still running after 5 seconds, no error" is the pass.
@@ -175,7 +175,7 @@ argcheck=$(docker run --rm --user 1001:1001 --cap-drop ALL --security-opt no-new
 import { spawn } from 'node:child_process';
 import * as lib from '/app/agent/lib.mjs';
 const { config } = lib.parseConfig({ DATA_DIR: '/tmp', ANTHROPIC_API_KEY: 'sk-ant-api03-argcheck00', GITHUB_TOKEN: 'github_pat_argcheck000000000000', AGENT_REPO: 'octo-org/website', DOCKHOLD_API_TOKEN: 'dh_argcheck00' });
-const args = lib.buildClaudeArgs(config, { issueNumber: 1, claudeMdPath: '/etc/hostname' });
+const args = lib.buildClaudeArgs(config, { issueNumber: 1 });
 const child = spawn('claude', args, { cwd: '/tmp', env: lib.claudeEnv(process.env, { ...config, home: '/tmp' }) });
 let err = '';
 child.stderr.on('data', (d) => { err += d; });
@@ -191,6 +191,33 @@ setTimeout(() => {
 }, 5000);
 " 2>&1 || true)
 report "every option the app passes is accepted: ${argcheck#ok }" "$(case "$argcheck" in ok*) echo true ;; *) echo false ;; esac)"
+
+# ---------------------------------------------------------------------------
+echo "==== Nothing planted in the checkout or the home folder is loaded"
+# tests/foothold-check.mjs runs the real Claude Code with the app's arguments
+# against a fake model API on the loopback address, in a checkout and a home
+# folder full of planted MCP servers, hooks, skills, commands and agents.
+# The control run drops --bare and --strict-mcp-config and must see them, or
+# the check proves nothing.
+foothold() { # [--control]
+  docker run --rm --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges \
+    --network none --read-only --tmpfs /tmp --memory 1g --memory-swap 1g \
+    -v "$(cd "$(dirname "$0")" && pwd)/foothold-check.mjs:/check/foothold-check.mjs:ro" \
+    --entrypoint node "$IMAGE" /check/foothold-check.mjs "$@" 2>&1 | tail -n 1
+}
+FH=$(foothold)
+FH_CONTROL=$(foothold --control)
+info "foothold check: $FH"
+info "foothold control: $FH_CONTROL"
+ok=true
+expect='{"without":{"code":0,"result":"success","mcp":[],"plantedListed":false,"ran":[],"err":""},"with":{"code":0,"result":"success","mcp":["dockhold"],"plantedListed":false,"ran":[],"err":""}}'
+[ "$FH" = "$expect" ] || { ok=false; echo "  planted MCP servers, hooks, skills or agents were loaded"; }
+case "$FH_CONTROL" in
+  *planted-project*planted-home*|*planted-home*planted-project*) ;;
+  *) ok=false; echo "  control: without the two flags the planted items were not seen, so the check proves nothing" ;;
+esac
+printf '%s' "$FH_CONTROL" | grep -q 'ran-project-hook' || { ok=false; echo "  control: the planted hook did not run"; }
+report "no planted MCP server (only dockhold with the token), hook, skill, command or agent loads; the control run sees them" $ok
 
 # ---------------------------------------------------------------------------
 echo "==== Start, no outbound network, read-only root"

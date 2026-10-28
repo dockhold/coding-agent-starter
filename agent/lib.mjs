@@ -35,6 +35,10 @@ const MAX_BUDGET_USD = 1000;
 const MAX_MINUTES = 1440;
 export const MAX_SUMMARY = 3000;
 const MAX_TITLE = 200;
+export const MAX_CLAUDE_MD = 64 * 1024;
+// An issue whose task was cut short this many times by the app stopping (a
+// crash, running out of memory) is not put back again on its own.
+export const MAX_INTERRUPTED_RUNS = 3;
 
 export const DEFAULTS = Object.freeze({
   AGENT_LABEL: 'agent',
@@ -148,10 +152,11 @@ function checkTestOverrides(env) {
   return { value: { api, git } };
 }
 
+// PORT 0 means any free port; only the tests use it.
 function checkPort(env) {
   const raw = value(env, 'PORT') || '8080';
   const port = /^[0-9]{1,5}$/.test(raw) ? Number(raw) : NaN;
-  if (!(port >= 1 && port <= 65535)) {
+  if (!(port >= 0 && port <= 65535)) {
     return { error: `PORT is set by Dockhold. Remove it ${VARS_TAB}` };
   }
   return { value: port };
@@ -203,6 +208,34 @@ export function secretValues(config) {
   return [config.anthropicKey, config.githubToken, config.dockholdToken].filter(Boolean);
 }
 
+// What the push guard looks for: each secret value, and its base64 form
+// (without padding). Exact matches only.
+export function secretNeedles(secrets) {
+  const needles = [];
+  for (const s of secrets) {
+    if (!s) continue;
+    needles.push(Buffer.from(s), Buffer.from(Buffer.from(s).toString('base64').replace(/=+$/, '')));
+  }
+  return needles;
+}
+
+// A streaming search for any needle. push() takes the next chunk and returns
+// true once a needle was seen, across chunk boundaries too.
+export function createScanner(needles) {
+  const keep = Math.max(0, ...needles.map((n) => n.length)) - 1;
+  let tail = Buffer.alloc(0);
+  let found = false;
+  return {
+    push(chunk) {
+      if (found) return true;
+      const buf = Buffer.concat([tail, chunk]);
+      found = needles.some((n) => buf.includes(n));
+      tail = keep > 0 ? buf.subarray(Math.max(0, buf.length - keep)) : Buffer.alloc(0);
+      return found;
+    },
+  };
+}
+
 export function redact(text, secrets) {
   let out = String(text ?? '');
   for (const s of secrets) if (s) out = out.split(s).join('[hidden]');
@@ -244,6 +277,43 @@ export function selectIssues(issues, done) {
   return { eligible, skipped };
 }
 
+// Issues that ran this many times in a row without finishing, because the
+// app stopped mid-task. Counts the trailing "interrupted" entries for the
+// issue; any other outcome for it resets the count.
+export function interruptedStreak(taskLogText, issueNumber) {
+  let streak = 0;
+  for (const line of String(taskLogText || '').split('\n')) {
+    let entry;
+    try {
+      entry = JSON.parse(line);
+    } catch {
+      continue;
+    }
+    if (entry?.issue !== issueNumber) continue;
+    streak = entry.outcome === 'interrupted' ? streak + 1 : 0;
+  }
+  return streak;
+}
+
+// author_association says MEMBER for any member of the owning organisation,
+// write access or not, so every author other than the owner is checked with
+// the collaborator permission endpoint. Write, maintain and admin may run.
+const LOGIN_RE = /^[A-Za-z0-9](?:[A-Za-z0-9]|-(?=[A-Za-z0-9])){0,38}$/;
+const WRITE_ROLES = new Set(['admin', 'maintain', 'write']);
+
+export function needsPermissionCheck(issue) {
+  return issue?.author_association !== 'OWNER';
+}
+
+export function authorLogin(issue) {
+  const login = issue?.user?.login;
+  return typeof login === 'string' && LOGIN_RE.test(login) ? login : '';
+}
+
+export function hasWriteAccess(answer) {
+  return WRITE_ROLES.has(answer?.role_name) || WRITE_ROLES.has(answer?.permission);
+}
+
 export function branchFor(issueNumber) {
   if (!Number.isInteger(issueNumber) || issueNumber < 1) throw new Error('issue number must be a positive integer');
   return `agent/issue-${issueNumber}`;
@@ -279,11 +349,23 @@ export function systemPrompt(issueNumber) {
   ].join(' ');
 }
 
-// The prompt is the issue's title and body only. Comments are not read.
-export function taskPrompt(issue) {
+// The prompt is the issue's title and body. Comments are not read. A
+// CLAUDE.md at the repository root follows, marked as the repository's own
+// instructions: it is repository content, so it goes in the prompt with the
+// issue rather than in the system prompt.
+export function taskPrompt(issue, claudeMd = '') {
   const title = String(issue.title || '').trim();
   const body = String(issue.body || '').trim();
-  return body ? `${title}\n\n${body}\n` : `${title}\n`;
+  const task = body ? `${title}\n\n${body}\n` : `${title}\n`;
+  const md = String(claudeMd || '').trim();
+  if (!md) return task;
+  return [
+    task,
+    '===== The repository\'s own instructions (CLAUDE.md at the repository root) =====',
+    md.length > MAX_CLAUDE_MD ? `${md.slice(0, MAX_CLAUDE_MD)}\n(cut at ${MAX_CLAUDE_MD} characters)` : md,
+    '===== End of the repository\'s own instructions =====',
+    '',
+  ].join('\n');
 }
 
 // The Dockhold MCP server, configured only when DOCKHOLD_API_TOKEN is set.
@@ -307,9 +389,10 @@ export function mcpConfigJson() {
 // Why --bare: without it, `claude -p` loads hooks, MCP servers and settings
 // from the checkout's own .claude/ folder and .mcp.json without any trust
 // prompt. Those files come from the repository, so a pull request could make
-// the next run execute anything. --bare loads none of them; the repository's
-// CLAUDE.md is passed on purpose with --append-system-prompt-file instead.
-export function buildClaudeArgs(config, { issueNumber, claudeMdPath = '' }) {
+// the next run execute anything. --bare loads none of them, and
+// --strict-mcp-config limits MCP servers to the one passed here. The
+// repository's CLAUDE.md goes in the prompt instead (see taskPrompt).
+export function buildClaudeArgs(config, { issueNumber }) {
   const tools = config.dockholdToken ? [...config.tools, 'mcp__dockhold'] : [...config.tools];
   const args = [
     '--bare',
@@ -320,8 +403,8 @@ export function buildClaudeArgs(config, { issueNumber, claudeMdPath = '' }) {
     '--max-budget-usd', String(config.budget),
     '--no-session-persistence',
     '--append-system-prompt', systemPrompt(issueNumber),
+    '--strict-mcp-config',
   ];
-  if (claudeMdPath) args.push('--append-system-prompt-file', claudeMdPath);
   if (config.dockholdToken) args.push('--mcp-config', mcpConfigJson());
   args.push('--output-format', 'stream-json', '--verbose');
   return args;

@@ -87,6 +87,8 @@ describe('config: refusals, one line each', () => {
   });
   it('PORT that is not a port', () => {
     assert.match(refusal(base({ PORT: 'abc' })), /^PORT is set by Dockhold/);
+    assert.match(refusal(base({ PORT: '65536' })), /^PORT is set by Dockhold/);
+    assert.equal(config({ PORT: '0' }).port, 0, 'PORT 0 (any free port) is for the tests');
   });
 });
 
@@ -129,6 +131,32 @@ describe('config: defaults and accepted values', () => {
     const c = config({ CODING_AGENT_TEST_GITHUB_API: 'http://127.0.0.1:4010', CODING_AGENT_TEST_GIT_URL: 'file:///tmp/r.git' });
     assert.equal(c.apiBase, 'http://127.0.0.1:4010');
     assert.equal(c.gitUrl, 'file:///tmp/r.git');
+  });
+});
+
+describe('write access and interrupted runs', () => {
+  it('every author but the owner is checked; write, maintain and admin may run', () => {
+    assert.equal(lib.needsPermissionCheck({ author_association: 'OWNER' }), false);
+    for (const a of ['MEMBER', 'COLLABORATOR', 'NONE', undefined]) assert.equal(lib.needsPermissionCheck({ author_association: a }), true);
+    for (const ok of [{ permission: 'admin', role_name: 'admin' }, { permission: 'write', role_name: 'maintain' },
+      { permission: 'write', role_name: 'write' }, { permission: 'write', role_name: 'custom-dev' }]) {
+      assert.equal(lib.hasWriteAccess(ok), true, JSON.stringify(ok));
+    }
+    for (const no of [{ permission: 'read', role_name: 'triage' }, { permission: 'read', role_name: 'read' },
+      { permission: 'none', role_name: '' }, null, {}]) {
+      assert.equal(lib.hasWriteAccess(no), false, JSON.stringify(no));
+    }
+    assert.equal(lib.authorLogin({ user: { login: 'octo-cat' } }), 'octo-cat');
+    for (const bad of ['dependabot[bot]', '../x', '', '-a', undefined]) assert.equal(lib.authorLogin({ user: { login: bad } }), '');
+  });
+  it('counts interrupted runs in a row per issue; any other outcome resets the count', () => {
+    const line = (issue, outcome) => JSON.stringify({ issue, outcome });
+    const log = [line(5, 'interrupted'), line(6, 'interrupted'), line(5, 'interrupted'), 'junk', line(6, 'pr')].join('\n');
+    assert.equal(lib.interruptedStreak(log, 5), 2);
+    assert.equal(lib.interruptedStreak(log, 6), 0);
+    assert.equal(lib.interruptedStreak(`${log}\n${line(5, 'stopped')}\n${line(5, 'interrupted')}`, 5), 1);
+    assert.equal(lib.interruptedStreak('', 5), 0);
+    assert.equal(lib.MAX_INTERRUPTED_RUNS, 3);
   });
 });
 
@@ -177,17 +205,19 @@ describe('the agent command line', () => {
     assert.match(after('--append-system-prompt'), /Do not commit, push/);
     assert.ok(!args.includes('--mcp-config'));
     assert.ok(!args.includes('--append-system-prompt-file'));
+    assert.ok(args.includes('--strict-mcp-config'), 'MCP servers only from the command line');
     assert.ok(!args.join(' ').includes('mcp__dockhold'));
     assert.ok(!args.includes('--dangerously-skip-permissions'));
   });
   it('with the Dockhold token: MCP server by reference, never the token itself', () => {
     const c = config({ DOCKHOLD_API_TOKEN: DH, AGENT_MODEL: 'opus', AGENT_MAX_BUDGET_USD: '0.5', AGENT_ALLOWED_TOOLS: 'Read,Edit' });
-    const args = lib.buildClaudeArgs(c, { issueNumber: 3, claudeMdPath: '/data/repo/CLAUDE.md' });
+    const args = lib.buildClaudeArgs(c, { issueNumber: 3 });
     const after = (flag) => args[args.indexOf(flag) + 1];
     assert.equal(after('--model'), 'opus');
     assert.equal(after('--max-budget-usd'), '0.5');
     assert.equal(after('--allowedTools'), 'Read,Edit,mcp__dockhold');
-    assert.equal(after('--append-system-prompt-file'), '/data/repo/CLAUDE.md');
+    assert.ok(args.includes('--strict-mcp-config'));
+    assert.ok(!args.includes('--append-system-prompt-file'));
     const mcp = JSON.parse(after('--mcp-config'));
     assert.deepEqual(mcp, {
       mcpServers: { dockhold: { type: 'http', url: 'https://api.dockhold.eu/mcp', headers: { Authorization: 'Bearer ${DOCKHOLD_API_TOKEN}' } } },
@@ -198,6 +228,19 @@ describe('the agent command line', () => {
   it('the prompt is the title and body only', () => {
     assert.equal(lib.taskPrompt({ title: ' Fix footer ', body: 'Use 2026.\n' }), 'Fix footer\n\nUse 2026.\n');
     assert.equal(lib.taskPrompt({ title: '--model x', body: null }), '--model x\n');
+  });
+  it("the repository's CLAUDE.md follows the issue, marked as the repository's own instructions", () => {
+    const p = lib.taskPrompt({ title: 'Fix', body: 'Body' }, 'Use tabs.\n');
+    assert.equal(p, [
+      'Fix\n\nBody\n',
+      "===== The repository's own instructions (CLAUDE.md at the repository root) =====",
+      'Use tabs.',
+      "===== End of the repository's own instructions =====",
+      '',
+    ].join('\n'));
+    assert.equal(lib.taskPrompt({ title: 'Fix', body: '' }, '  \n'), 'Fix\n');
+    const long = lib.taskPrompt({ title: 'Fix' }, 'x'.repeat(lib.MAX_CLAUDE_MD + 10));
+    assert.match(long, /cut at 65536 characters/);
   });
 });
 
@@ -264,6 +307,21 @@ describe('output: escaping, redaction, summaries', () => {
     const page = (prUrl) => lib.renderStatus({ repo: 'a/b', label: 'agent', current: null, last: { issue: 1, title: 't', time: 1, outcome: 'pr', prUrl }, nextPollAt: 1, lastPollError: '' });
     assert.ok(page('https://github.com/a/b/pull/9').includes('<a href="https://github.com/a/b/pull/9">'));
     assert.ok(!page('javascript:alert(1)').includes('<a href'));
+  });
+  it('the push guard finds a secret or its base64, across chunk boundaries, and nothing else', () => {
+    const needles = lib.secretNeedles([KEY, '', GH]);
+    assert.equal(needles.length, 4);
+    const scan = (...chunks) => {
+      const s = lib.createScanner(needles);
+      return chunks.map((c) => s.push(Buffer.from(c))).at(-1);
+    };
+    assert.equal(scan(`a ${KEY} b`), true);
+    assert.equal(scan('x'.repeat(10), KEY.slice(0, 7), KEY.slice(7), 'tail'), true);
+    assert.equal(scan(Buffer.from(GH).toString('base64')), true);
+    const b64 = Buffer.from(KEY).toString('base64');
+    assert.equal(scan(b64.slice(0, 5), b64.slice(5)), true);
+    assert.equal(scan(KEY.slice(0, -1), 'Z'), false);
+    assert.equal(scan('nothing here', 'at all'), false);
   });
   it('redacts secret values', () => {
     assert.equal(lib.redact(`key ${KEY} and ${GH} twice ${KEY}`, [KEY, GH, '']), 'key [hidden] and [hidden] twice [hidden]');
