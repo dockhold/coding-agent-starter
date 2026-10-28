@@ -10,8 +10,10 @@
 # only: no outbound network (proves the app downloads nothing to start) and a
 # read-only root file system with a tmpfs /tmp (proves it writes nothing
 # outside /data and /tmp). A real task run needs the network, because the
-# agent must reach its model provider and GitHub, so no task runs here. The
-# loop itself is tested end to end with fakes in tests/loop.test.mjs.
+# agent must reach its model provider and GitHub, so no real task runs here.
+# One task runs against fakes on the loopback address (a fake GitHub API, a
+# local repository, a fake agent that misbehaves); the loop itself is tested
+# end to end with fakes in tests/loop.test.mjs.
 #
 # Usage: tests/smoke.sh <image>
 # Needs: docker, bash 4 or newer. Exits non-zero if any case fails.
@@ -49,7 +51,7 @@ report() { if [ "$2" = true ]; then pass "$1"; else fail "$1"; fi; }
 info() { echo "INFO  $1"; }
 
 cleanup() {
-  docker rm -f "$APP" "$CURL" >/dev/null 2>&1 || true
+  docker rm -f "$APP" "$CURL" "$RUN-gh" >/dev/null 2>&1 || true
   docker network rm "$NET" >/dev/null 2>&1 || true
   docker run --rm -v "$BASE:/b" "$HELPER_IMAGE" sh -c 'rm -rf /b/* /b/.[!.]* 2>/dev/null; true' >/dev/null 2>&1 || true
   rmdir "$BASE" 2>/dev/null || true
@@ -255,12 +257,20 @@ ver=$(docker exec --user 1001:1001 -e HOME=/data/home "$APP" claude --version 2>
 report "claude --version runs as uid 1001 on the read-only root: $ver" \
   "$([ -n "$PINNED" ] && printf '%s' "$ver" | grep -qF "$PINNED" && echo true || echo false)"
 
+report "process 1 is tini" "$([ "$(docker exec "$APP" cat /proc/1/comm)" = tini ] && echo true || echo false)"
+
+# Both tini (process 1) and the program (its child) start with the app's
+# environment. Neither may be readable by another process of user 1001.
 ok=true
-if docker exec --user 1001:1001 "$APP" sh -c 'cat /proc/1/environ' 2>/dev/null | tr '\0' '\n' | grep -q GITHUB_TOKEN; then
-  ok=false; echo "  another uid 1001 process read the app's environment"
-fi
-[ "$(docker exec "$APP" sh -c 'stat -c %u /proc/1/environ')" = 0 ] || { ok=false; echo "  /proc/1/environ is not hidden from uid 1001"; }
-report "the app's environment (GITHUB_TOKEN) is not readable by another uid 1001 process" $ok
+NODE_PID=$(docker exec "$APP" sh -c 'for p in /proc/[0-9]*; do [ "$(cat $p/comm 2>/dev/null)" = node ] && [ "$(cut -d" " -f4 $p/stat)" = 1 ] && echo ${p#/proc/}; done; true')
+[ -n "$NODE_PID" ] || { ok=false; echo "  the program is not tini's child"; }
+for pid in 1 $NODE_PID; do
+  if docker exec --user 1001:1001 "$APP" sh -c "cat /proc/$pid/environ" 2>/dev/null | tr '\0' '\n' | grep -q GITHUB_TOKEN; then
+    ok=false; echo "  another uid 1001 process read the environment of process $pid"
+  fi
+  [ "$(docker exec "$APP" stat -c %u "/proc/$pid/environ")" = 0 ] || { ok=false; echo "  /proc/$pid/environ is not hidden from uid 1001"; }
+done
+report "the environment (GITHUB_TOKEN) of tini and of the program is not readable by another uid 1001 process" $ok
 
 ok=false
 for _ in $(seq 1 120); do
@@ -288,6 +298,92 @@ for v in "$KEY" "$GHT" "$DHT"; do
   if app_logs | grep -qF -- "$v"; then ok=false; echo "  the log contains a secret value"; fi
 done
 report "no secret value in the container log" $ok
+
+# ---------------------------------------------------------------------------
+echo "==== A process the agent leaves behind never sees the GitHub token"
+# One task against fakes, with no network: a fake GitHub API (tests/fake-github.mjs)
+# in a second container whose loopback address the app shares, a local
+# repository as the remote, and a fake agent that detaches a scanner. The
+# scanner keeps forking and reads every process's environment and command
+# line, looking for the token, while the app fetches and pushes with it.
+# The remote's pre-receive hook holds the push open for 2 seconds, so the
+# git process that carries the token lives long enough to be seen; with the
+# protections taken out of the image, the scanner does find the token.
+# After the task: the scanner is gone, the token was never seen, and no
+# zombie is left (tini reaps what the app kills).
+TESTS_DIR=$(cd "$(dirname "$0")" && pwd)
+ADV=$(mktemp -d "$BASE/adv.XXXXXX")
+mkdir -p "$ADV/bin" "$ADV/gh"
+cat > "$ADV/bin/claude" <<'AGENT'
+#!/bin/sh
+cat > /dev/null
+setsid sh -c 'while :; do ( for p in /proc/[0-9]*; do tr "\0" "\n" < $p/environ 2>/dev/null | grep -E "GIT_CONFIG_VALUE|GITHUB_TOKEN" >> /data/stolen; tr "\0" " " < $p/cmdline 2>/dev/null | grep -iE "github_pat|basic " >> /data/stolen; done ) & sleep 0.05; done' > /dev/null 2>&1 < /dev/null &
+echo $! > /data/scanner.pid
+sleep 1
+echo hello > hello.txt
+echo '{"type":"result","subtype":"success","is_error":false,"num_turns":1,"result":"Added hello.txt.","total_cost_usd":0.01}'
+AGENT
+docker run --rm --user 0:0 -v "$ADV:/a" --entrypoint sh "$IMAGE" -c '
+  set -e
+  chmod 0755 /a /a/bin /a/bin/claude
+  chown 1001:1001 /a/gh
+  git init -q --bare -b main /a/remote.git
+  git init -q -b main /tmp/seed && cd /tmp/seed && echo seed > README.md && git add -A
+  git -c user.name=t -c user.email=t@t commit -qm seed && git push -q /a/remote.git main
+  printf "#!/bin/sh\nsleep 2\n" > /a/remote.git/hooks/pre-receive
+  chmod 0755 /a/remote.git/hooks/pre-receive
+  chown -R 1001:1001 /a/remote.git' >/dev/null
+D_ADV=$(new_datadir)
+docker rm -f "$APP" "$RUN-gh" >/dev/null 2>&1 || true
+docker run -d --name "$RUN-gh" --network none --user 1001:1001 \
+  -v "$TESTS_DIR:/tests:ro" -v "$ADV/gh:/gh" \
+  --entrypoint node "$IMAGE" /tests/fake-github.mjs serve 4010 /gh/state.json >/dev/null
+docker run -d --name "$APP" --network "container:$RUN-gh" \
+  --user 1001:1001 --cap-drop ALL --security-opt no-new-privileges \
+  --memory 1g --memory-swap 1g --read-only --tmpfs /tmp:rw,nosuid,nodev,size=64m \
+  -e PORT=8080 -e DATA_DIR=/data -v "$D_ADV:/data" \
+  -v "$ADV/bin:/fakebin:ro" -v "$ADV/remote.git:/remote.git" \
+  -e PATH=/fakebin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+  "${APPENV[@]}" -e CODING_AGENT_TEST_GITHUB_API=http://127.0.0.1:4010 \
+  -e CODING_AGENT_TEST_GIT_URL=file:///remote.git "$IMAGE" >/dev/null
+ok=false
+for _ in $(seq 1 120); do
+  if app_logs | grep -q '^#1: pull request '; then ok=true; break; fi
+  sleep 0.5
+done
+report "the task ran: fetch, agent, push and pull request" $ok
+sleep 1
+# Every process in the app, seen from a process started with docker exec
+# (which is left out, as are its own children).
+PROCS=$(docker exec "$APP" node -e '
+const fs = require("fs");
+const rows = [];
+for (const n of fs.readdirSync("/proc")) {
+  if (!/^[0-9]+$/.test(n) || Number(n) === process.pid) continue;
+  try {
+    const s = fs.readFileSync(`/proc/${n}/stat`, "utf8");
+    const r = s.slice(s.lastIndexOf(")") + 2).split(" ");
+    rows.push(`${n}:${s.slice(s.indexOf("(") + 1, s.lastIndexOf(")"))}:${r[0]}`);
+  } catch {}
+}
+console.log(rows.join(" "));' 2>&1)
+info "processes after the task: $PROCS"
+zombies=$(printf '%s' "$PROCS" | tr ' ' '\n' | grep -c ':Z$' || true)
+others=$(printf '%s' "$PROCS" | tr ' ' '\n' | grep -vcE '^1:tini:|^[0-9]+:node:' || true)
+report "the scanner is gone: only tini and the program are left ($others others)" "$([ "$others" = 0 ] && echo true || echo false)"
+report "no zombie left ($zombies)" "$([ "$zombies" = 0 ] && echo true || echo false)"
+# Control: the scanner ran and could read command lines (it records its own,
+# which name what it looks for). Without this the 0 below proves nothing.
+lines=$(docker exec "$APP" sh -c 'cat /data/stolen 2>/dev/null | wc -l' || echo 0)
+report "control: the scanner ran and recorded $lines lines of its own" "$([ "${lines:-0}" -gt 0 ] && echo true || echo false)"
+B64=$(printf 'x-access-token:%s' "$GHT" | base64 | tr -d '\n')
+seen=$(docker exec "$APP" sh -c "cat /data/stolen 2>/dev/null | grep -cF -e '$GHT' -e '$B64'" || true)
+report "the scanner saw the token, or its header, ${seen:-0} times (want 0)" "$([ "${seen:-0}" = 0 ] && echo true || echo false)"
+t0=$(date +%s%N)
+docker stop -t 30 "$APP" >/dev/null
+ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+code=$(docker inspect -f '{{.State.ExitCode}}' "$APP")
+report "SIGTERM after a task: exit code $code in $ms ms (want 0, under 10000)" "$([ "$code" = 0 ] && [ "$ms" -lt 10000 ] && echo true || echo false)"
 
 # ---------------------------------------------------------------------------
 echo "==== Summary: $PASS_COUNT passed, $FAIL_COUNT failed"

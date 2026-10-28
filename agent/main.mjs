@@ -330,11 +330,19 @@ async function prepareCheckout(branch, defaultBranch) {
 
 // Ends every process the agent left behind (a server it started, a process
 // it detached), so nothing it ran is still around while git holds the token.
-// Walks /proc for descendants of this program; when the program is the main
-// process, detached processes are reparented to it and are found too. Each
-// one is stopped first (SIGSTOP), so it cannot start new ones, and the walk
-// repeats until a pass finds nothing new; then all of them are killed.
-function descendants() {
+//
+// In the app, tini is process 1 and this program is its only child. A
+// process the agent detached is re-parented to tini, so it is no longer a
+// descendant of this program; and each app sees only its own processes,
+// so everything in it other than tini, this program and its git children
+// came from the agent. That whole set is swept. Anywhere else (the tests on
+// a developer machine) only this program's descendants are, so a sweep can
+// never touch an unrelated process.
+//
+// Each stray is stopped first (SIGSTOP), so it cannot start new ones, and
+// the scan repeats until a pass finds nothing new; then all are killed and
+// tini reaps them.
+function processTable() {
   const parent = new Map();
   for (const name of readdirOr('/proc')) {
     if (!/^[0-9]+$/.test(name)) continue;
@@ -342,12 +350,27 @@ function descendants() {
     const ppid = Number(stat.slice(stat.lastIndexOf(')') + 2).split(' ')[1]);
     if (Number.isInteger(ppid)) parent.set(Number(name), ppid);
   }
+  return parent;
+}
+
+const UNDER_TINI = process.ppid === 1 && readFileOr('/proc/1/comm', '').trim() === 'tini';
+
+// The chain of parents from pid up, at most 64 steps.
+function ancestors(parent, pid) {
+  const chain = [];
+  for (let p = parent.get(pid); p && chain.length < 64; p = parent.get(p)) chain.push(p);
+  return chain;
+}
+
+function strays() {
+  const parent = processTable();
+  const git = new Set([...gitChildren].map((c) => c.pid));
   const found = [];
   for (const pid of parent.keys()) {
-    if (pid === process.pid || [...gitChildren].some((c) => c.pid === pid)) continue;
-    let p = parent.get(pid);
-    for (let hops = 0; p && p !== process.pid && hops < 64; hops += 1) p = parent.get(p);
-    if (p === process.pid) found.push(pid);
+    if (pid === 1 || pid === process.pid || git.has(pid)) continue;
+    const chain = ancestors(parent, pid);
+    if (chain.some((p) => git.has(p))) continue; // git's own helpers
+    if (UNDER_TINI || chain.includes(process.pid)) found.push(pid);
   }
   return found;
 }
@@ -364,7 +387,7 @@ function sweepStrays(groupId = 0) {
   if (groupId) signalPid(-groupId, 'SIGKILL');
   const stopped = new Set();
   for (let pass = 0; pass < MAX_SWEEP_PASSES; pass += 1) {
-    const fresh = descendants().filter((pid) => !stopped.has(pid));
+    const fresh = strays().filter((pid) => !stopped.has(pid));
     if (fresh.length === 0) break;
     for (const pid of fresh) {
       signalPid(pid, 'SIGSTOP');

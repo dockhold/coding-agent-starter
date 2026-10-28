@@ -33,6 +33,6 @@ mkdir -p "$DATA_DIR/home"
 chmod 0700 "$DATA_DIR/home"
 export HOME="$DATA_DIR/home"
 
-# exec makes the program the main process, so the stop signal reaches it
+# exec makes the program the only child of tini, so the stop signal reaches it
 # directly and it can stop the agent and put the issue label back.
 exec node /app/agent/main.mjs

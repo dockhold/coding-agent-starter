@@ -10,6 +10,7 @@ import http from 'node:http';
 import os from 'node:os';
 import path from 'node:path';
 import { after, afterEach, before, describe, it } from 'node:test';
+import { fakeGitHub } from './fake-github.mjs';
 
 const ROOT = path.resolve(import.meta.dirname, '..');
 const KEY = 'sk-ant-api03-LOOPTESTKEY000000000000';
@@ -49,59 +50,6 @@ process.stdin.on('end', () => {
   out({ type: 'result', subtype: 'success', is_error: false, num_turns: 2, result: 'Added hello.txt.', total_cost_usd: 0.1234 });
 });
 `;
-
-function fakeGitHub() {
-  const db = { issues: [], labels: new Map(), comments: [], pulls: [], auth: new Set(), perms: new Map(), failLabel: new Set() };
-  const server = http.createServer((req, res) => {
-    let raw = '';
-    req.on('data', (d) => { raw += d; });
-    req.on('end', () => {
-      db.auth.add(req.headers.authorization);
-      const url = new URL(req.url, 'http://x');
-      const body = raw ? JSON.parse(raw) : null;
-      const send = (code, data) => { res.writeHead(code, { 'Content-Type': 'application/json' }); res.end(JSON.stringify(data)); };
-      const p = url.pathname.replace(`/repos/${OWNER_REPO}`, '');
-      let m;
-      if (req.method === 'GET' && p === '') return send(200, { default_branch: 'main' });
-      if (req.method === 'GET' && p === '/issues') {
-        const label = url.searchParams.get('labels');
-        return send(200, db.issues.filter((i) => db.labels.get(i.number)?.has(label)));
-      }
-      if ((m = p.match(/^\/issues\/(\d+)\/labels\/(.+)$/)) && req.method === 'DELETE') {
-        const set = db.labels.get(Number(m[1]));
-        if (!set?.delete(decodeURIComponent(m[2]))) return send(404, { message: 'Label does not exist' });
-        return send(200, []);
-      }
-      if ((m = p.match(/^\/collaborators\/([^/]+)\/permission$/)) && req.method === 'GET') {
-        const perm = db.perms.get(decodeURIComponent(m[1]));
-        return perm ? send(200, perm) : send(404, { message: 'Not Found' });
-      }
-      if ((m = p.match(/^\/issues\/(\d+)\/labels$/)) && req.method === 'POST') {
-        if (db.failLabel.has(Number(m[1]))) return send(500, { message: 'Server Error' });
-        for (const l of body.labels) db.labels.get(Number(m[1])).add(l);
-        return send(200, []);
-      }
-      if ((m = p.match(/^\/issues\/(\d+)\/comments$/)) && req.method === 'POST') {
-        db.comments.push({ issue: Number(m[1]), body: body.body });
-        return send(201, {});
-      }
-      if (p === '/pulls' && req.method === 'GET') {
-        return send(200, db.pulls.filter((pr) => `octo-org:${pr.head}` === url.searchParams.get('head')));
-      }
-      if (p === '/pulls' && req.method === 'POST') {
-        const pr = { ...body, number: 100 + db.pulls.length, html_url: `https://github.com/${OWNER_REPO}/pull/${100 + db.pulls.length}` };
-        db.pulls.push(pr);
-        return send(201, pr);
-      }
-      if ((m = p.match(/^\/pulls\/(\d+)$/)) && req.method === 'PATCH') {
-        Object.assign(db.pulls.find((pr) => pr.number === Number(m[1])), body);
-        return send(200, {});
-      }
-      return send(404, { message: 'Not Found' });
-    });
-  });
-  return { db, server };
-}
 
 const issue = (number, title, author = 'OWNER', extra = {}) => ({
   number, title, body: `Body of ${number}`, author_association: author, user: { login: `user-${number}` },
