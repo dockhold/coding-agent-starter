@@ -203,6 +203,7 @@ describe('the agent command line', () => {
     assert.ok(args.includes('--no-session-persistence'));
     assert.match(after('--append-system-prompt'), /issue #12/);
     assert.match(after('--append-system-prompt'), /Do not commit, push/);
+    assert.match(after('--append-system-prompt'), /Your reply becomes the pull request description/);
     assert.ok(!args.includes('--mcp-config'));
     assert.ok(!args.includes('--append-system-prompt-file'));
     assert.ok(args.includes('--strict-mcp-config'), 'MCP servers only from the command line');

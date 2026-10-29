@@ -16,3 +16,7 @@ in one stage from Debian bookworm slim instead of from the Node image. Node
 is installed from its official release in the same step that sets the
 modes of node, git and tini, so the image no longer copies a whole file
 system from one build stage into another, a step some image builds refuse.
+
+Prompt change, no change on App storage: the agent is told that the app
+commits for it and that its reply becomes the pull request description, so
+the description no longer says the agent did not commit.
