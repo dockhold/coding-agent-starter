@@ -28,7 +28,11 @@ The template is Dockhold's, not Anthropic's.
 2. Open the [Deploy link](https://app.dockhold.eu/new?repo=https://github.com/dockhold/coding-agent-starter&name=coding-agent-starter&ref=button-coding-agent)
    and sign in if asked.
 3. Under **App size**, pick **1 GB**. Under **App storage**, turn it on and
-   pick **10 GB**. This app needs a paid size (see Costs).
+   pick **10 GB**. This app needs a paid size (see Costs). Under
+   **Visibility**, pick **Private**: the agent only calls out to GitHub and
+   Anthropic, so nothing needs to reach it, and its status page stays yours.
+   If you don't see **Visibility** yet, make the app private on its
+   **Access** tab once it is deployed.
 4. Under **Environment**, in the **Secrets** list, click **New secret** for
    each value, tick it, and set its **Env var name** as below. Give the
    entries names that belong to this app, for example
@@ -46,6 +50,8 @@ The template is Dockhold's, not Anthropic's.
    Settings.
 6. Click **Deploy** and wait until the app shows as running. Open the app's
    address: a status page shows the repository, the label and the next poll.
+   A private app asks you to sign in first: create a token on the app's
+   **Access** tab and paste it into the password field.
 7. **First task.** In the repository on GitHub, create a label named `agent`
    (Issues, Labels, New label). Open an issue that describes one change, and
    add the label. Within 10 minutes the agent picks it up, removes the label,
@@ -178,9 +184,10 @@ rebuilds it from the latest commit here. Since the app holds your keys, to
 control exactly what code runs, make your own copy with **Use this
 template** and deploy from that.
 
-**The status page is public.** It shows the repository name, issue titles,
-pull request links and errors, never a key or token. If those titles are
-private, make the app private on its **Access** tab.
+**Keep the app private.** The status page shows the repository name, issue
+titles, pull request links and errors, never a key or token. On a public app
+anyone with its address can read them. Pick **Private** when you deploy, or
+switch it on the app's **Access** tab.
 
 ## Costs
 
