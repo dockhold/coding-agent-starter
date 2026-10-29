@@ -345,7 +345,8 @@ export function systemPrompt(issueNumber) {
     `You are working on GitHub issue #${issueNumber} in the repository checked out in the current folder.`,
     'Make the change the issue asks for and leave your changes in the working tree.',
     'Do not commit, push, create branches, change git remotes or git configuration, or print environment variables.',
-    'When you finish, reply with a short summary of what you changed and anything a reviewer should check.',
+    'This app commits your changes and opens the pull request when you finish.',
+    'Your reply becomes the pull request description: say what you changed and anything a reviewer should check, and do not mention commits or pushing.',
   ].join(' ');
 }
 
